@@ -315,25 +315,32 @@ final class OpenCodeServerManager: @unchecked Sendable {
                 portBox.fulfill(.success(port))
             }
         }
-        // stderr 持续 drain，避免缓冲区写满阻塞子进程；同样要做 EOF 防护
+        // stderr 持续 drain，避免缓冲区写满阻塞子进程；同样要做 EOF 防护。
+        // ⭐ 顺手把内容累积进 stderrBuf：子进程异常退出时（决策见 memory
+        // opencode-codesign-deep-resources-kill），把 opencode 真实报错带进错误信息，
+        // 否则死因被直接丢弃、只能靠 ~/Library/Logs/DiagnosticReports 倒查。
+        let stderrBuf = StderrAccumulator()
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            if handle.availableData.isEmpty {
+            let data = handle.availableData
+            if data.isEmpty {
                 handle.readabilityHandler = nil
+                return
             }
+            stderrBuf.append(data)
         }
 
         try proc.run()
         SubprocessRegistry.shared.register(proc)
 
         // 超时兜底
-        Task.detached { @Sendable in
+        Task.detached { @Sendable [portBox, stderrBuf] in
             try? await Task.sleep(nanoseconds: 10_000_000_000)
-            portBox.fulfill(.failure(OpenCodeServerError.startupTimeout))
+            portBox.fulfill(.failure(OpenCodeServerError.startupTimeout(detail: stderrBuf.snapshot())))
         }
 
-        // 进程提前退出兜底（说明 binary 有问题或 OPENCODE_SERVER_PASSWORD 校验失败）
-        proc.terminationHandler = { [portBox] _ in
-            portBox.fulfill(.failure(OpenCodeServerError.processExitedEarly))
+        // 进程提前退出兜底（binary 签名无效被系统强杀 / OPENCODE_SERVER_PASSWORD 校验失败等）
+        proc.terminationHandler = { [portBox, stderrBuf] p in
+            portBox.fulfill(.failure(OpenCodeServerError.processExitedEarly(detail: Self.exitDetail(p, stderr: stderrBuf.snapshot()))))
         }
 
         let port: Int = try await withCheckedThrowingContinuation { cont in
@@ -369,27 +376,63 @@ final class OpenCodeServerManager: @unchecked Sendable {
         guard let m = match, m.numberOfRanges >= 2 else { return nil }
         return Int(ns.substring(with: m.range(at: 1)))
     }
+
+    /// 把子进程退出状态 + stderr 尾巴拼成可读诊断串（提前退出兜底用）
+    private static func exitDetail(_ proc: Process, stderr: String) -> String {
+        let head: String
+        if proc.terminationReason == .uncaughtSignal {
+            // signal 9(SIGKILL) 且零输出 = 代码签名无效 / JIT 被内核强杀
+            // （macOS 27 + bun 二进制签名坑，见 memory opencode-codesign-deep-resources-kill）
+            head = "被信号 \(proc.terminationStatus) 终止"
+                + (proc.terminationStatus == 9 ? "（SIGKILL，常见=代码签名无效 / JIT 被系统拦）" : "")
+        } else {
+            head = "退出码 \(proc.terminationStatus)"
+        }
+        return stderr.isEmpty ? head : "\(head)；stderr: \(stderr)"
+    }
 }
 
 // MARK: - 错误类型
 
 enum OpenCodeServerError: LocalizedError {
     case bundledBinaryMissing
-    case startupTimeout
-    case processExitedEarly
+    case startupTimeout(detail: String)
+    case processExitedEarly(detail: String)
     case healthCheckFailed
 
     var errorDescription: String? {
         switch self {
         case .bundledBinaryMissing:
             return "找不到内嵌的 opencode 二进制（HermesPet.app/Contents/Resources/opencode）"
-        case .startupTimeout:
-            return "opencode server 启动超时（10s 没监听端口）"
-        case .processExitedEarly:
-            return "opencode 子进程在 ready 之前就退出了"
+        case .startupTimeout(let detail):
+            return "opencode server 启动超时（10s 没监听端口）" + (detail.isEmpty ? "" : "：\(detail)")
+        case .processExitedEarly(let detail):
+            return "opencode 子进程在 ready 之前就退出了" + (detail.isEmpty ? "" : "（\(detail)）")
         case .healthCheckFailed:
             return "opencode server 健康检查未通过"
         }
+    }
+}
+
+// MARK: - Stderr 累积器
+
+/// 线程安全累积子进程 stderr（capped 8KB），异常退出时把真实报错带进错误信息。
+/// readabilityHandler 在后台线程 fire → `@unchecked Sendable` + NSLock（同 OneShotBox 模式）。
+final class StderrAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    private let cap = 8192
+
+    func append(_ chunk: Data) {
+        lock.lock(); defer { lock.unlock() }
+        guard data.count < cap else { return }
+        data.append(chunk.prefix(cap - data.count))
+    }
+
+    func snapshot() -> String {
+        lock.lock(); defer { lock.unlock() }
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 }
 

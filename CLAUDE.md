@@ -11,7 +11,7 @@ Swift 6 + SwiftUI（macOS 13+，主力测试机 macOS 26.3.1）。点击顶部�
 | **Codex** | 喷射机器人 #1C2A3A | wand.and.stars | spawn `codex exec -i` 子进程 | 本地写代码 + 原生视觉 |
 | **QwenCode**（`.qwenCode`） | 眼镜怪兽 #21B6A8 | q.circle.fill | spawn `qwen` CLI 子进程（`-o stream-json`，复用终端登录态） | 零配置零 Key，qwen 用户开箱即用 |
 
-当前版本：**v1.4.6**。分发已转 Developer ID 签名 + Apple 公证（见决策 #4 / #19）。
+当前版本：**v1.4.7**。分发已转 Developer ID 签名 + Apple 公证（见决策 #4 / #19）。
 
 ---
 
@@ -224,6 +224,7 @@ PillView 端只 `.onReceive` 监听 `HermesPetIslandHoverChanged` 通知更新 `
 - 公证凭据：keychain profile `HermesPetNotary`；`make-dmg.sh` 的 `notarytool` 轮询已抗断网（合盖睡眠不会废）
 - bundle id 已从 `com.nousresearch.hermespet` 改成 `com.basionwang.hermespet`（设置靠 `SchemaMigrator.migrateLegacyBundleIDDomain` 迁移；**但 TCC 权限按 bundle id 记，老用户这一次升级所有权限要重新授权一次**，不可避免）
 - ⚠️ **公开发布仓库 `basionwang-bot/HermesPet` 绝不能设私有**，否则 UpdateChecker 匿名 GET 变 404，全员自动更新失效
+- ⭐⭐ **`codesign --deep` 不会重签 `Contents/Resources/` 里的裸可执行文件（`opencode`）**（v1.4.7，2026-06-18，macOS 27 升级后「在线 AI 连接断开」事故）：app 内嵌的 opencode 是 bun 编译的二进制，`--deep` 只签 Frameworks/PlugIns 这类"被识别为嵌套代码"的项，**不管 Resources 里的裸可执行文件** → opencode 一直保留 bun 编译自带的 `linker-signed adhoc` 签名。macOS 26 容忍，**macOS 27 收紧页校验后内核以 `CODESIGNING / Invalid Page` 直接 SIGKILL**（崩溃报告 `~/Library/Logs/DiagnosticReports/opencode-*.ips` 的 `termination` 实锤，现象=`OpenCodeServerError.processExitedEarly`「opencode 子进程在 ready 之前就退出了」+ 退出码 137）。`make-dmg.sh` 一直是**从内到外单独逐个签**（先 opencode 后 app、无 --deep）所以分发版没事，坏的只是 `build.sh`/`install.sh` 之前用单条 `--deep`。**铁律：内嵌任何裸可执行文件（opencode / 将来的 bun/node helper）都必须单独 `codesign --options runtime --entitlements ... --sign <ID>` 签它本身，再签主 app，并 `codesign --verify --strict` 校验——绝不能指望 --deep。** 调试手法：手动跑 `~/Library/Application Support/HermesPet/bin/opencode serve --port 0 --hostname 127.0.0.1` 看退出码（137=被强杀），零输出+137=系统在 exec 阶段拦截（签名/JIT/Gatekeeper）。详见 memory `[[opencode-codesign-deep-resources-kill]]`
 
 ### 5. Swift 6 并发：避免 @MainActor 类的 closure 被传到后台线程
 - `@MainActor` 类的内部 closure 会被自动推断为 @MainActor 隔离

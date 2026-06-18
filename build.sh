@@ -118,20 +118,30 @@ if [ -z "$SIGN_IDENTITY" ]; then
     SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
         | awk -F\" '/Apple Development/{print $2; exit}')"
 fi
+OPENCODE_IN_APP="$APP_BUNDLE/Contents/Resources/opencode"
 if [ -n "$SIGN_IDENTITY" ]; then
     echo "🔐 证书签名（Hardened Runtime + entitlements）: $SIGN_IDENTITY"
+    # ⭐ 必须【从内到外、单独逐个签】，绝不能只用 --deep：
+    #   --deep 只签 Frameworks/PlugIns 这类"被识别为嵌套代码"的项，
+    #   【不会重签 Contents/Resources/ 里的裸可执行文件 opencode】。
+    #   于是 opencode 一直保留 bun 编译自带的 linker-signed adhoc 签名 ——
+    #   macOS 26 容忍，但 macOS 27 收紧后内核以 CODESIGNING / Invalid Page 直接 SIGKILL，
+    #   现象：在线 AI "连接断开 / opencode 子进程在 ready 之前就退出了"（2026-06-18 实锤）。
+    #   修法：先单独给 opencode 签 Developer ID + hardened runtime + JIT entitlements，再签主 app。
+    #   （make-dmg.sh 一直这么做、分发版没事；本地构建之前漏了，macOS 27 升级后才暴露。）
     # Desktop 在 iCloud 同步范围时，fileproviderd 会每隔几百毫秒往 .app 根目录写回
     # com.apple.FinderInfo / com.apple.fileprovider.fpfs#P → codesign 报
-    # "resource fork ... detritus not allowed"。必须"清完 xattr 立刻签"，中间不能插耗时操作，
-    # 否则 daemon 趁机写回。所以用单条 --deep 一次性签内嵌 opencode + 主 app
-    # （--deep 会把同一份 entitlements 一并套到 opencode，而 opencode 本就需要 JIT 那几条，正合适）。
+    # "resource fork ... detritus not allowed"。必须"清完 xattr 立刻签"，中间不插耗时操作。
     # 最多重试 3 次抢在 daemon 写回前完成。本地构建用 --timestamp=none，离线也不卡。
     sign_ok=0
     for attempt in 1 2 3; do
         find "$APP_BUNDLE" -exec xattr -c {} + 2>/dev/null || true
         xattr -d com.apple.FinderInfo "$APP_BUNDLE" 2>/dev/null || true
         xattr -d "com.apple.fileprovider.fpfs#P" "$APP_BUNDLE" 2>/dev/null || true
-        if codesign --force --deep --options runtime --timestamp=none --entitlements "$ENTITLEMENTS" \
+        # 先签内嵌 opencode（bun，需 hardened runtime + JIT entitlements），再签最外层主 app
+        if codesign --force --options runtime --timestamp=none --entitlements "$ENTITLEMENTS" \
+               --sign "$SIGN_IDENTITY" "$OPENCODE_IN_APP" 2>/dev/null \
+           && codesign --force --options runtime --timestamp=none --entitlements "$ENTITLEMENTS" \
                --sign "$SIGN_IDENTITY" "$APP_BUNDLE" 2>/dev/null; then
             sign_ok=1
             break
@@ -142,8 +152,18 @@ if [ -n "$SIGN_IDENTITY" ]; then
         echo "❌ codesign 失败（iCloud daemon 反复写回 xattr？）"
         exit 1
     fi
+    # 校验内嵌 opencode 签名有效（macOS 27 启动必需；签名无效会被内核 CODESIGNING 强杀）
+    if codesign --verify --strict "$OPENCODE_IN_APP" 2>/dev/null; then
+        echo "   ✅ 内嵌 opencode 签名校验通过"
+    else
+        echo "   ❌ 内嵌 opencode 签名校验未过 —— macOS 27 上会被强杀，已中断构建"
+        exit 1
+    fi
 else
     echo "🔐 未找到可用证书，退回到 ad-hoc 签名（不开 Hardened Runtime；每次构建后可能需重新授权）"
+    # 同理：ad-hoc 也要【单独签 opencode】，否则它保留 bun 的 linker-signed adhoc 签名，
+    # macOS 27 照样强杀。先单独签 opencode，再 --deep 签主 app。
+    codesign --force --sign - "$OPENCODE_IN_APP" 2>/dev/null || true
     codesign --force --deep --sign - "$APP_BUNDLE" 2>/dev/null || true
 fi
 
